@@ -1,7 +1,3 @@
-/* rsimai 2022-03-20 indoor air sensor with bme280 and ccs811, 
-  SSD1306 display, 2 capacitive sensor buttons and esp32. All
-  connected through I2C */
-
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
@@ -10,22 +6,45 @@
 #include <Adafruit_CCS811.h>
 #include <Preferences.h>
 
-Preferences preferences;
-
-Adafruit_CCS811 ccs; // I2C
-Adafruit_BME280 bme; // I2C
-
-U8X8_SSD1306_128X64_NONAME_HW_I2C u8x8(/* reset=*/ U8X8_PIN_NONE);
-
 String version="2022-03-20";
-int baudrate = 115200;
 
+
+/* hardware pins Gx */
+int ledred = 4;  
+int ledyellow = 0;
+int ledgreen = 2;
+int keypin1 = 34;
+int keypin2 = 35;
+
+/* hardware settings */
+Preferences preferences; // prepare flash
+Adafruit_CCS811 ccs;     // I2C
+Adafruit_BME280 bme;     // I2C
+U8X8_SSD1306_128X64_NONAME_HW_I2C u8x8(/* reset=*/ U8X8_PIN_NONE); // display
+int baudrate = 115200;   // serial interface
+int initcounter; 
+int ccswarmup = 300; //co2 sensor needs 5+ minutes to warm up
+int ledredchannel = 0;    // PWM channel
+int ledyellowchannel = 1;
+int ledgreenchannel = 2;
+int ledredbright = 240;   // default brightness
+int ledyellowbright = 255;
+int ledgreenbright = 35;
+const int freq = 1000;    // PWM frequency
+const int resolution = 8; // PWM resolution
+
+/* defaults, can be overwritten from flash */
 boolean serialout = true;  // default: serial on
 boolean ledon = true;      // default: LEDs on
 int everysec = 2;          // default: read and update every 2 seconds
-int ccsdrivemode = 1;      // default: 1 sec readings from the ccs
+int ccsdrivemode = 10;     // default: 10 sec readings from the ccs
 boolean powersave = false; // default: start with powersave off
 
+/* floating average for smoother changes */
+float ratio1 = 0.75;
+float ratio2 = 0.25;
+
+/* thresholds */
 int co2l1 = 1000; // green below
 int co2l2 = 1400;
 int co2l3 = 2000;
@@ -36,8 +55,7 @@ int humidl2 = 40;
 int humidl3 = 60;
 int humidl4 = 70; // too high above
 
-int initcounter = 300 / everysec; //co2 sensor needs 5+ minutes to warm up
-
+/* keys */
 boolean key1;
 boolean lastkey1;
 int keyduration1;
@@ -65,60 +83,37 @@ char rco2[7];
 char rtvoc[7];
 int co2level = 0; //0-4 for warnings, 5 warmup
 
-float ratio1 = 0.75; //floating average 1/4
-float ratio2 = 0.25;
-
-int ledred = 4;           // hardware pin
-int ledyellow = 0;
-int ledgreen = 2;
-int ledredchannel = 0;    // PWM channel
-int ledyellowchannel = 1;
-int ledgreenchannel = 2;
-int ledredbright = 240;   // default brightness
-int ledyellowbright = 255;
-int ledgreenbright = 35;
-const int freq = 1000;    // PWM frequency
-const int resolution = 8; // PWM resolution
-
-int keypin1 = 34;
-int keypin2 = 35;
-
 String command; //for the serial interface
 
 void setup() {
+  /* hardware */
   pinMode(keypin1, INPUT); //down button
   pinMode(keypin2, INPUT); //up button
   pinMode(ledgreen, OUTPUT); 
   pinMode(ledyellow, OUTPUT);
   pinMode(ledred, OUTPUT);
+  /* LEDs */
   ledcSetup(ledredchannel, freq, resolution);
   ledcSetup(ledyellowchannel, freq, resolution);
   ledcSetup(ledgreenchannel, freq, resolution);
   ledcAttachPin(ledred, ledredchannel);
   ledcAttachPin(ledyellow, ledyellowchannel);
   ledcAttachPin(ledgreen, ledgreenchannel);
-  
-  ledplay();  
-  
-  //pinMode(32, OUTPUT); //beeper
-  //digitalWrite(32, LOW); //beeper off
-
-  preferences.begin("sensor", false);
-
-  bool flash = preferences.getBool("flashavailable");
-
+  /* flash */
+  preferences.begin("sensor", false); // open the sensor namespace rw
+  bool flash = preferences.getBool("flashavailable"); // values available?
+  /* display */
   u8x8.begin();
   u8x8.setPowerSave(0);
   splash();
   ledplay();
-    
+  /* serial interface */  
   Serial.begin(baudrate);
   Serial.setTimeout(2000);
   ledplay();
-
   Serial.print("bme280-ccs811-096oled ");
   Serial.println(version);
-
+  /* read defaults from flash, if available */
   if ( flash == true ) {
     Serial.println("flash available, reading values");
     loadvars();
@@ -126,30 +121,30 @@ void setup() {
   else {
     Serial.println("no flash, using defaults");
   }
-
+  /* init ccs */
   if(!ccs.begin()){
     Serial.println("Failed to start ccs811. Halt.");
     while(1);
   }
-
+  initcounter = ccswarmup / everysec; // make it 5 minutes
   while(!ccs.available()); //give it a sec
   setccsdrivemode();
-
   Serial.println(F("ccs811 init done"));
+  /* init BME */
   unsigned status;
   status = bme.begin(0x76); //AZ-Delivery's 280 is on 0x76, not 0x77
   if (!status) {
     Serial.println("Failed to start BME280. Halt.");
     while (1) delay(10);
   }
-
   bme.setSampling(Adafruit_BME280::MODE_NORMAL, 
                     Adafruit_BME280::SAMPLING_X1, // temperature 
                     Adafruit_BME280::SAMPLING_X1, // pressure 
                     Adafruit_BME280::SAMPLING_X1, // humidity 
-                    Adafruit_BME280::FILTER_OFF   ); 
-  
+                    Adafruit_BME280::FILTER_OFF,
+                    Adafruit_BME280::STANDBY_MS_0_5);
   Serial.println("BME280 init done");
+  /* start serial comms */
   if ( serialout == true ) {
     Serial.print("start sending values, every ");
     Serial.print(everysec);
@@ -159,7 +154,7 @@ void setup() {
     Serial.println("sending values disabled");
   }
   Serial.println("");
-
+  /* set display and averages to start the loop */
   firstrun(); //set floating averages to actuals
   u8x8.setPowerSave(powersave);
   prepdisplay();
@@ -171,6 +166,9 @@ void setccsdrivemode() {
   }
   else if ( ccsdrivemode == 10 ){
     ccs.setDriveMode(CCS811_DRIVE_MODE_10SEC);
+  }
+  else if ( ccsdrivemode == 60 ) {
+    ccs.setDriveMode(CCS811_DRIVE_MODE_60SEC);
   }
 }
 
@@ -235,11 +233,11 @@ void valuesdisplay() { // values updates only, dynamic
   u8x8.setCursor(6,2);
   u8x8.print(rhumid); 
   u8x8.setCursor(4,3);
-  if ( avg_co2 >400 ) {
+  if ( avg_co2 >400 ) { // BME can't go below 400
     u8x8.print(rco2); 
   }
   else {
-    u8x8.print("   min");
+    u8x8.print("   min"); 
   }
   u8x8.setCursor(4,4);
   u8x8.print(rtvoc); 
@@ -250,25 +248,23 @@ void valuesdisplay() { // values updates only, dynamic
 }
 
 void serial_out() {
-  Serial.print(F("Temperature = "));
-  Serial.print(temp);
-  Serial.println(" °C");
-
-  Serial.print(F("Pressure = "));
-  Serial.print(press);
-  Serial.println(" hPa ");
-  
-  Serial.print("Humidity = ");
-  Serial.print(humid);
-  Serial.println(" %");
-
-  Serial.print("CO2 = ");
-  Serial.print(co2);
-  Serial.println(" ppm");
-
-  Serial.print("TVOC = ");
-  Serial.print(tvoc);
-  Serial.println(" ppb");
+  if ( serialout == true ) {
+    Serial.print(F("Temperature = "));
+    Serial.print(temp);
+    Serial.println(" °C");
+    Serial.print(F("Pressure = "));
+    Serial.print(press);
+    Serial.println(" hPa ");
+    Serial.print("Humidity = ");
+    Serial.print(humid);
+    Serial.println(" %");
+    Serial.print("CO2 = ");
+    Serial.print(co2);
+    Serial.println(" ppm");
+    Serial.print("TVOC = ");
+    Serial.print(tvoc);
+    Serial.println(" ppb");
+  }
 }
 
 void readbme() {
@@ -316,6 +312,7 @@ void  serialhelp() {
   Serial.println("rate10         - 10 seconds refresh");
   Serial.println("ccsdrivemode1  - ccs reads every second");
   Serial.println("ccsdrivemode10 - ccs reads every 10 seconds");
+  Serial.println("ccsdrivemode60 - ccs reads every 60 seconds");
   Serial.println("list           - list variables in use");
   Serial.println("save           - save variables to flash");
   Serial.println("load           - load variables from flash");
@@ -332,9 +329,8 @@ void snack() {
 }
 
 void serialconfig() {
-  //beep();
   u8x8.clearDisplay();
-  u8x8.setPowerSave(0);
+  u8x8.setPowerSave(0); // force display on
   u8x8.setCursor(0,0);
   u8x8.print("Serial port open");
   u8x8.setCursor(0,1);
@@ -403,6 +399,11 @@ void serialconfig() {
       setccsdrivemode();
       sack();
     }
+    else if ( command == "ccsdrivemode60" ) {
+      ccsdrivemode = 60;
+      setccsdrivemode();
+      sack();
+    }
     else if ( command == "list" ) {
       listvars();
       sack();
@@ -423,7 +424,7 @@ void serialconfig() {
       serialhelp();
       sack();
     }
-    else if (( command == "exit" ) or ( digitalRead(34) == true)) {
+    else if (( command == "exit" ) or ( digitalRead(keypin1) == true)) {
       Serial.println("exit config");
       //beep();
       u8x8.setCursor(0,4);
@@ -438,10 +439,9 @@ void serialconfig() {
     }
   }
 
-  delay(1000);
+  delay(1000); // leaving the serial mode
   u8x8.clearDisplay();
-  u8x8.setPowerSave(powersave);
-  //powersave = 0;
+  u8x8.setPowerSave(powersave); // restore previous
   prepdisplay();
 }
 
@@ -464,7 +464,7 @@ void savevars() {
   preferences.putBool("ledon", ledon);
   preferences.putInt("rate", everysec);
   preferences.putInt("ccsdrivemode", ccsdrivemode);
-  preferences.putBool("flashavailable", true); // check if read from flash possible
+  preferences.putBool("flashavailable", true); // read from flash available on boot
 }
 
 void loadvars() {
@@ -497,7 +497,6 @@ void splash() {
 }
 
 void warnings() {
-  // warning text
   if ( avg_humid < humidl1 ) {
     text_humid = "Humidity too low";
   }
@@ -517,7 +516,7 @@ void warnings() {
     text_humid = "Humidity undef  ";
   }
 
-  if ( initcounter > 0 ) {
+  if ( initcounter > 0 ) {  // ccs not yet reliable, no messages
     text_co2 = "CO2 warmup ";
     text_co2.concat(initcounter);
     text_co2 = text_co2 + "  ";
@@ -589,9 +588,10 @@ void ledout() {
 }
 
 void checkkey() {
-  for (int count = 0; count < (everysec * 100 - 5); count++) { //overall timing
+  for (int count = 0; count < (everysec * 100 - 5); count++) {  //overall timing without using interrupts
   key1 = digitalRead(keypin1);
   key2 = digitalRead(keypin2);
+  
   if ( key1 == true) {
     keyduration1++;
     if ( keyduration1 > ( 100 * longkey )) {
@@ -634,29 +634,17 @@ void checkkey() {
     }
     lastkey2 = key2;
   }
-  
   delay(10);
   }
 }
 
-//void beep() {
-//  digitalWrite(32, HIGH); //beep
-//  delay(5);
-//  digitalWrite(32, LOW);
-//}
-
 void loop() {
-
-  readbme();
-  readccs();
-  floatingaverage();
-  warnings();
-
-  if ( serialout == true ) {
-    serial_out();
-  }
-
-  ledout();
-  valuesdisplay();
-  checkkey();          
+  readbme();         // read bme sensor
+  readccs();         // read ccs sensor
+  floatingaverage(); // smooth value changes
+  warnings();        // evaluate values
+  serial_out();      // serial values out
+  ledout();          // set the LEDs
+  valuesdisplay();   // update the oled display
+  checkkey();        // check keys, pause for next cycle
 }
